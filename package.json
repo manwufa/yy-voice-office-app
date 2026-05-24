@@ -1,0 +1,44 @@
+{
+  "name": "always-on-voice-office",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k -n server,renderer,electron -c green,blue,magenta \"npm:dev:server\" \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:server": "tsx watch src/server/index.ts",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:electron": "wait-on http://127.0.0.1:8787/health http://127.0.0.1:5173 && npm run build:electron && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 SIGNAL_SERVER_URL=ws://127.0.0.1:8787/ws electron .",
+    "build": "npm run typecheck && npm run build:renderer && npm run build:electron && npm run build:server",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start:server": "node dist/server/server/index.js"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.2.0",
+    "cross-env": "^7.0.3",
+    "electron": "^42.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^8.0.14",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.5.13",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.7",
+    "wait-on": "^8.0.1"
+  }
+}
