@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YY Voice Office 下载</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: #1b1f24;
+        background: #f5f6f8;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(920px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 48px 0;
+      }
+      header { margin-bottom: 28px; }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 32px;
+        font-weight: 720;
+      }
+      p {
+        margin: 0;
+        color: #58616d;
+        line-height: 1.7;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 14px;
+      }
+      .card {
+        border: 1px solid #d9dee5;
+        border-radius: 8px;
+        background: #fff;
+        padding: 18px;
+      }
+      .card h2 {
+        margin: 0 0 8px;
+        font-size: 18px;
+      }
+      .card p {
+        min-height: 56px;
+        font-size: 14px;
+      }
+      a.button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        min-height: 42px;
+        margin-top: 16px;
+        border-radius: 6px;
+        color: #fff;
+        background: #1f6feb;
+        font-weight: 650;
+        text-decoration: none;
+      }
+      .note {
+        margin-top: 20px;
+        border-left: 4px solid #b7c2d0;
+        padding: 12px 14px;
+        background: #fff;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>YY Voice Office 下载</h1>
+        <p>下载对应系统的压缩包，解压后运行客户端。客户端会自动连接 xz42 上的语音服务。</p>
+      </header>
+
+      <section class="grid">
+        <article class="card">
+          <h2>Windows x64</h2>
+          <p>适用于 64 位 Windows。解压后运行 YY Voice Office.exe。</p>
+          <a class="button" href="./downloads/YY-Voice-Office-0.1.5-windows-x64.zip">下载 Windows 版</a>
+        </article>
+
+        <article class="card">
+          <h2>macOS Apple Silicon</h2>
+          <p>适用于 M1/M2/M3/M4 系列芯片。解压后先运行 Open YY Voice Office.command。</p>
+          <a class="button" href="./downloads/YY-Voice-Office-0.1.5-macos-arm64.zip">下载 macOS ARM 版</a>
+        </article>
+
+        <article class="card">
+          <h2>macOS Intel</h2>
+          <p>适用于 Intel 芯片 Mac。解压后先运行 Open YY Voice Office.command。</p>
+          <a class="button" href="./downloads/YY-Voice-Office-0.1.5-macos-x64.zip">下载 macOS Intel 版</a>
+        </article>
+      </section>
+
+      <p class="note">软件内更新会走增量更新，只下载应用代码变更，不重复下载 Electron 运行时的 DLL、LICENSE 和 pak 文件。macOS 包未使用 Apple 开发者证书签名，首次打开如果提示“已损坏”或“无法验证”，请运行压缩包里的 Open YY Voice Office.command；包内 README-macOS.txt 也有手动命令。</p>
+    </main>
+  </body>
+</html>

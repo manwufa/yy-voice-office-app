@@ -34,17 +34,20 @@ interface SessionRecord {
 export interface SignalingHubOptions {
   iceConfig?: IceConfig;
   now?: () => number;
+  heartbeatTimeoutMs?: number;
 }
 
 export class SignalingHub {
   private readonly iceConfig: IceConfig;
   private readonly now: () => number;
+  private readonly heartbeatTimeoutMs: number;
   private readonly clients = new Map<UserId, ConnectedClient>();
   private readonly sessions = new Map<SessionId, SessionRecord>();
 
   constructor(options: SignalingHubOptions = {}) {
     this.iceConfig = options.iceConfig ?? makeIceConfig();
     this.now = options.now ?? Date.now;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 70_000;
   }
 
   connect(user: UserProfile, send: SendMessage): void {
@@ -56,6 +59,19 @@ export class SignalingHub {
         fromUserId: user.id,
         reason: 'replaced'
       });
+    }
+
+    for (const [existingUserId, existingClient] of [...this.clients.entries()]) {
+      if (existingUserId === user.id) continue;
+      if (!samePersonIdentity(existingClient.user, user)) continue;
+
+      existingClient.send({
+        type: 'voice.session.end',
+        sessionId: 'replaced',
+        fromUserId: user.id,
+        reason: 'replaced'
+      });
+      this.disconnect(existingUserId);
     }
 
     const presence: PeerPresence = {
@@ -82,11 +98,13 @@ export class SignalingHub {
     this.broadcastPresence(presence, user.id);
   }
 
-  disconnect(userId: UserId): void {
+  disconnect(userId: UserId, expectedSend?: SendMessage): void {
     const client = this.clients.get(userId);
     if (!client) return;
+    if (expectedSend && client.send !== expectedSend) return;
 
     this.clients.delete(userId);
+    this.endActiveSessionsFor(userId, 'unavailable');
     const offlinePresence: PeerPresence = {
       ...client.presence,
       status: 'offline',
@@ -95,6 +113,18 @@ export class SignalingHub {
     };
 
     this.broadcastPresence(offlinePresence, userId);
+  }
+
+  touch(userId: UserId, expectedSend?: SendMessage, now = this.now()): void {
+    const client = this.clients.get(userId);
+    if (!client) return;
+    if (expectedSend && client.send !== expectedSend) return;
+
+    client.lastPongAt = now;
+    client.presence = {
+      ...client.presence,
+      lastSeen: now
+    };
   }
 
   handleMessage(userId: UserId, rawMessage: unknown): void {
@@ -125,13 +155,18 @@ export class SignalingHub {
         this.endSession(client, message.sessionId, message.toUserId, message.reason);
         break;
       case 'heartbeat.pong':
-        client.lastPongAt = this.now();
+        this.touch(userId);
         break;
     }
   }
 
   makeHeartbeat(now = this.now()): void {
-    for (const client of this.clients.values()) {
+    for (const [userId, client] of [...this.clients.entries()]) {
+      if (now - client.lastPongAt > this.heartbeatTimeoutMs) {
+        this.disconnect(userId);
+        continue;
+      }
+
       client.send({ type: 'heartbeat.ping', at: now });
     }
   }
@@ -182,6 +217,12 @@ export class SignalingHub {
     const existing = this.sessions.get(message.sessionId);
     if (existing?.state === 'ended') {
       this.sendError(client, 'ended_session', 'This session was already ended.', message.sessionId);
+      return;
+    }
+
+    const activeSession = this.findActiveSessionBetween(client.user.id, message.toUserId);
+    if (activeSession && activeSession.sessionId !== message.sessionId) {
+      this.sendError(client, 'active_session', 'A voice session with this peer is already active.', message.sessionId);
       return;
     }
 
@@ -308,6 +349,35 @@ export class SignalingHub {
     return fromUserId !== toUserId;
   }
 
+  private findActiveSessionBetween(aUserId: UserId, bUserId: UserId): SessionRecord | undefined {
+    return [...this.sessions.values()].find(
+      (session) =>
+        session.state === 'active' &&
+        ((session.initiatorId === aUserId && session.responderId === bUserId) ||
+          (session.initiatorId === bUserId && session.responderId === aUserId))
+    );
+  }
+
+  private endActiveSessionsFor(userId: UserId, reason: EndReason): void {
+    for (const session of this.sessions.values()) {
+      if (session.state !== 'active') continue;
+      if (session.initiatorId !== userId && session.responderId !== userId) continue;
+
+      session.state = 'ended';
+      session.endedBy = userId;
+      session.reason = reason;
+      session.updatedAt = this.now();
+
+      const otherUserId = session.initiatorId === userId ? session.responderId : session.initiatorId;
+      this.clients.get(otherUserId)?.send({
+        type: 'voice.session.end',
+        sessionId: session.sessionId,
+        fromUserId: userId,
+        reason
+      });
+    }
+  }
+
   private getPeersFor(userId: UserId): PeerPresence[] {
     return [...this.clients.entries()]
       .filter(([peerId]) => peerId !== userId)
@@ -326,4 +396,12 @@ export class SignalingHub {
   private sendError(client: ConnectedClient, code: string, message: string, sessionId?: SessionId): void {
     client.send({ type: 'error', code, message, sessionId });
   }
+}
+
+function samePersonIdentity(a: UserProfile, b: UserProfile): boolean {
+  return a.teamId === b.teamId && normalizeDisplayName(a.displayName) === normalizeDisplayName(b.displayName);
+}
+
+function normalizeDisplayName(displayName: string): string {
+  return displayName.trim().toLocaleLowerCase();
 }

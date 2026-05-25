@@ -12,6 +12,17 @@ type ErrorListener = (message: string) => void;
 type IncomingRequestListener = (request: { peerId: UserId; sessionId: SessionId; note?: string }) => void;
 type FeedbackKind = 'rejected' | 'mic-enabled' | 'one-way';
 type FeedbackListener = (feedback: { peerId: UserId; sessionId: SessionId; kind: FeedbackKind }) => void;
+export type LocalMediaFailureKind = 'insecure-context' | 'media-devices-unavailable';
+
+export class LocalMediaUnavailableError extends Error {
+  readonly kind: LocalMediaFailureKind;
+
+  constructor(kind: LocalMediaFailureKind) {
+    super(kind);
+    this.name = 'LocalMediaUnavailableError';
+    this.kind = kind;
+  }
+}
 
 interface ManagedSession {
   sessionId: SessionId;
@@ -27,6 +38,7 @@ interface ManagedSession {
   queuedCandidates: RTCIceCandidateInit[];
   remoteAudio: HTMLAudioElement;
   restartTimer: number | null;
+  networkNoticeSent: boolean;
   reason?: EndReason;
 }
 
@@ -59,6 +71,7 @@ export class VoiceClient {
     const existing = this.sessionsByPeer.get(peerId);
     if (existing && existing.state !== 'ended' && existing.state !== 'failed') return;
 
+    await this.ensureLocalStream();
     const sessionId = crypto.randomUUID();
     const session = await this.createSession(peerId, sessionId, true, true, 'outgoing');
     session.state = 'requesting';
@@ -195,7 +208,7 @@ export class VoiceClient {
         this.handleFeedback(message.fromUserId, message.sessionId, message.kind);
         break;
       case 'error':
-        this.emitError(message.message);
+        this.emitError(this.describeServerError(message.code, message.sessionId, message.message));
         if (message.sessionId) this.updateSessionState(message.sessionId, 'failed');
         break;
     }
@@ -270,7 +283,8 @@ export class VoiceClient {
       localSenders: [],
       queuedCandidates: [],
       remoteAudio,
-      restartTimer: null
+      restartTimer: null,
+      networkNoticeSent: false
     };
 
     if (attachLocalAudio) await this.attachLocalAudio(session);
@@ -315,7 +329,16 @@ export class VoiceClient {
   private async ensureLocalStream(): Promise<void> {
     if (this.localStream?.active) return;
 
-    this.localStream = await navigator.mediaDevices.getUserMedia({
+    if (!window.isSecureContext && window.location.protocol !== 'file:') {
+      throw new LocalMediaUnavailableError('insecure-context');
+    }
+
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.getUserMedia) {
+      throw new LocalMediaUnavailableError('media-devices-unavailable');
+    }
+
+    this.localStream = await mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -414,6 +437,10 @@ export class VoiceClient {
     if (session.manualEnded || session.state === 'ended') return;
     if (session.restartTimer !== null) return;
 
+    if (!session.networkNoticeSent) {
+      this.emitError('双方之间的语音网络连接中断，正在自动恢复；这不是麦克风权限问题。');
+      session.networkNoticeSent = true;
+    }
     this.setSessionState(session, 'reconnecting');
     session.restartTimer = window.setTimeout(async () => {
       session.restartTimer = null;
@@ -424,6 +451,7 @@ export class VoiceClient {
         if (session.isOfferer) await this.makeOffer(session);
       } catch {
         this.setSessionState(session, 'failed', 'network');
+        this.emitError('双方之间的 P2P 语音网络恢复失败；本机和对方都在线时，请检查 NAT/TURN 或网络限制。');
       }
     }, 1_000);
   }
@@ -432,6 +460,7 @@ export class VoiceClient {
     const session = this.sessionsById.get(sessionId) ?? this.sessionsByPeer.get(peerId);
     if (!session) return;
     this.closeSession(session, reason, reason === 'hangup' || reason === 'rejected', false);
+    this.emitError(this.describeRemoteEnd(reason));
   }
 
   private handleFeedback(peerId: UserId, sessionId: SessionId, kind: FeedbackKind): void {
@@ -499,5 +528,28 @@ export class VoiceClient {
 
   private emitIncomingRequest(peerId: UserId, sessionId: SessionId, note?: string): void {
     for (const listener of this.incomingRequestListeners) listener({ peerId, sessionId, note });
+  }
+
+  private describeServerError(code: string, sessionId: SessionId | undefined, fallback: string): string {
+    const session = sessionId ? this.sessionsById.get(sessionId) : undefined;
+    const peerLabel = session ? '对方' : '目标用户';
+
+    if (code === 'peer_offline') return `${peerLabel}的客户端已离线或网络断开；不是你这边的麦克风权限问题。`;
+    if (code === 'unauthorized') return '服务端拒绝了这次语音信令；这是权限或会话范围问题，不是麦克风或网络问题。';
+    if (code === 'inactive_session' || code === 'ended_session') return '本次语音会话已经结束，后续信令被忽略；不是麦克风权限问题。';
+    if (code === 'active_session') return '你和对方已经有一条语音连接，不能重复发起；请先挂断当前连接。';
+    if (code === 'bad_message' || code === 'bad_json') return '本机客户端发送的信令格式异常；请刷新页面或重启客户端。';
+    return `服务端信令错误：${fallback}`;
+  }
+
+  private describeRemoteEnd(reason: EndReason): string {
+    if (reason === 'busy') return '对方当前处于勿扰或隐身状态，未接入你的语音；不是你这边的麦克风问题。';
+    if (reason === 'unavailable') return '对方当前不在线或语音不可用；不是你这边的麦克风问题。';
+    if (reason === 'unauthorized') return '服务端拒绝了本次语音连接；这是权限问题，不是麦克风或网络问题。';
+    if (reason === 'rejected') return '对方已拒绝本次语音；不是你这边的麦克风或网络问题。';
+    if (reason === 'hangup') return '对方已挂断本次语音。';
+    if (reason === 'network') return '对方的语音连接因网络中断结束；问题在双方网络链路，不是麦克风权限。';
+    if (reason === 'replaced') return '对方在另一个客户端重新上线，本次连接已被替换。';
+    return '应用正在关闭，本次语音已结束。';
   }
 }

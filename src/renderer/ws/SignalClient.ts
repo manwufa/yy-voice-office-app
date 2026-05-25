@@ -1,6 +1,7 @@
 import type { ClientMessage, PeerPresence, ServerMessage, UserProfile } from '../../shared/protocol.js';
 
 type SignalStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
+type SignalCloseInfo = { code: number; reason: string; wasClean: boolean };
 
 interface SignalClientOptions {
   url: string;
@@ -10,6 +11,7 @@ interface SignalClientOptions {
 
 type MessageListener = (message: ServerMessage) => void;
 type StatusListener = (status: SignalStatus) => void;
+type CloseListener = (info: SignalCloseInfo) => void;
 
 export class SignalClient {
   private readonly options: SignalClientOptions;
@@ -18,6 +20,7 @@ export class SignalClient {
   private reconnectAttempt = 0;
   private readonly messageListeners = new Set<MessageListener>();
   private readonly statusListeners = new Set<StatusListener>();
+  private readonly closeListeners = new Set<CloseListener>();
   private status: SignalStatus = 'idle';
 
   user: UserProfile | null = null;
@@ -42,7 +45,7 @@ export class SignalClient {
       const message = JSON.parse(event.data as string) as ServerMessage;
       if (message.type === 'server.hello') {
         this.user = message.user;
-        this.peers = message.peers;
+        this.peers = normalizePeerList(message.peers);
       }
       if (message.type === 'presence.update') {
         this.peers = upsertPeer(this.peers, message.peer);
@@ -53,8 +56,16 @@ export class SignalClient {
       for (const listener of this.messageListeners) listener(message);
     });
 
-    this.socket.addEventListener('close', () => {
+    this.socket.addEventListener('close', (event) => {
+      for (const listener of this.closeListeners) {
+        listener({ code: event.code, reason: event.reason, wasClean: event.wasClean });
+      }
       if (!this.shouldReconnect) {
+        this.setStatus('closed');
+        return;
+      }
+      if (event.code === 4401) {
+        this.shouldReconnect = false;
         this.setStatus('closed');
         return;
       }
@@ -66,9 +77,9 @@ export class SignalClient {
     });
   }
 
-  close(): void {
+  close(code = 1000, reason = 'client-close'): void {
     this.shouldReconnect = false;
-    this.socket?.close();
+    this.socket?.close(code, reason);
   }
 
   send(message: ClientMessage): void {
@@ -86,6 +97,11 @@ export class SignalClient {
     this.statusListeners.add(listener);
     listener(this.status);
     return () => this.statusListeners.delete(listener);
+  }
+
+  onClose(listener: CloseListener): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
   }
 
   private scheduleReconnect(): void {
@@ -111,7 +127,28 @@ export class SignalClient {
 }
 
 function upsertPeer(peers: PeerPresence[], peer: PeerPresence): PeerPresence[] {
-  const next = peers.filter((item) => item.id !== peer.id);
+  const peerName = normalizeDisplayName(peer.displayName);
+  if (peer.status === 'offline') {
+    return peers.filter((item) => item.id !== peer.id && normalizeDisplayName(item.displayName) !== peerName);
+  }
+
+  const next = peers.filter((item) => item.id !== peer.id && normalizeDisplayName(item.displayName) !== peerName);
   next.push(peer);
-  return next.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  return normalizePeerList(next);
+}
+
+function normalizePeerList(peers: PeerPresence[]): PeerPresence[] {
+  const byName = new Map<string, PeerPresence>();
+  for (const peer of peers) {
+    if (peer.status === 'offline') continue;
+    const key = normalizeDisplayName(peer.displayName);
+    const existing = byName.get(key);
+    if (!existing || peer.lastSeen >= existing.lastSeen) byName.set(key, peer);
+  }
+
+  return [...byName.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+function normalizeDisplayName(displayName: string): string {
+  return displayName.trim().toLocaleLowerCase();
 }

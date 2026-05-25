@@ -96,6 +96,58 @@ describe('SignalingHub', () => {
     );
   });
 
+  it('marks heartbeat-stale clients offline', () => {
+    let now = 1_000;
+    const hub = new SignalingHub({
+      now: () => now,
+      heartbeatTimeoutMs: 1_000
+    });
+    const alice: ServerMessage[] = [];
+    const bob: ServerMessage[] = [];
+
+    hub.connect(users[0], (message) => alice.push(message));
+    hub.connect(users[1], (message) => bob.push(message));
+    now += 500;
+    hub.handleMessage('alice', { type: 'heartbeat.pong', at: now });
+    now += 501;
+    hub.makeHeartbeat(now);
+
+    expect(hub.getClientCount()).toBe(1);
+    expect(alice).toContainEqual(
+      expect.objectContaining({
+        type: 'presence.update',
+        peer: expect.objectContaining({ id: 'bob', status: 'offline', voiceAvailable: false })
+      })
+    );
+  });
+
+  it('replaces older connections with the same display name', () => {
+    const hub = new SignalingHub();
+    const alice: ServerMessage[] = [];
+    const olderMm: ServerMessage[] = [];
+    const newerMm: ServerMessage[] = [];
+
+    hub.connect(users[0], (message) => alice.push(message));
+    hub.connect({ id: 'mm-old', displayName: 'MM', teamId: 'online' }, (message) => olderMm.push(message));
+    hub.connect({ id: 'mm-new', displayName: 'MM', teamId: 'online' }, (message) => newerMm.push(message));
+
+    expect(hub.getClientCount()).toBe(2);
+    expect(hub.getPresence('mm-old')).toBeUndefined();
+    expect(hub.getPresence('mm-new')).toMatchObject({ displayName: 'MM', status: 'online' });
+    expect(olderMm).toContainEqual(
+      expect.objectContaining({
+        type: 'voice.session.end',
+        reason: 'replaced'
+      })
+    );
+    expect(alice).toContainEqual(
+      expect.objectContaining({
+        type: 'presence.update',
+        peer: expect.objectContaining({ id: 'mm-old', status: 'offline' })
+      })
+    );
+  });
+
   it('preserves manual hangup semantics by ending the session', () => {
     const { hub, alice, bob } = connectPair();
 
@@ -151,6 +203,54 @@ describe('SignalingHub', () => {
       fromUserId: 'bob',
       kind: 'one-way'
     });
+  });
+
+  it('rejects a second active session between the same two people', () => {
+    const { hub, alice, bob } = connectPair();
+
+    hub.handleMessage('alice', {
+      type: 'voice.session.request',
+      sessionId: 's5',
+      toUserId: 'bob',
+      mode: 'sendonly'
+    });
+    hub.handleMessage('bob', {
+      type: 'voice.session.request',
+      sessionId: 's6',
+      toUserId: 'alice',
+      mode: 'sendonly'
+    });
+
+    expect(bob).toContainEqual(
+      expect.objectContaining({
+        type: 'error',
+        code: 'active_session',
+        sessionId: 's6'
+      })
+    );
+    expect(alice.filter((message) => message.type === 'voice.session.request' && message.sessionId === 's6')).toHaveLength(0);
+  });
+
+  it('ends active sessions when a participant disconnects', () => {
+    const { hub, alice } = connectPair();
+
+    hub.handleMessage('alice', {
+      type: 'voice.session.request',
+      sessionId: 's7',
+      toUserId: 'bob',
+      mode: 'sendonly'
+    });
+    hub.disconnect('bob');
+
+    expect(hub.getSession('s7')?.state).toBe('ended');
+    expect(alice).toContainEqual(
+      expect.objectContaining({
+        type: 'voice.session.end',
+        sessionId: 's7',
+        fromUserId: 'bob',
+        reason: 'unavailable'
+      })
+    );
   });
 
   it('broadcasts presence separately from voice availability', () => {

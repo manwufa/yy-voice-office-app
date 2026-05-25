@@ -2,9 +2,16 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
+import type { ServerMessage } from '../shared/protocol.js';
 import { authenticateRequest } from './auth.js';
 import { makeIceConfig } from './ice.js';
 import { SignalingHub } from './signaling.js';
+
+interface AliveWebSocket extends WebSocket {
+  isAlive: boolean;
+  userId?: string;
+  displayNameKey?: string;
+}
 
 const host = process.env.HOST ?? '127.0.0.1';
 const port = Number(process.env.PORT ?? 8787);
@@ -19,10 +26,16 @@ const server = createServer((req, res) => {
   const isReadRequest = req.method === 'GET' || req.method === 'HEAD';
   const headOnly = req.method === 'HEAD';
 
+  if (req.method === 'OPTIONS') {
+    writeCorsPreflight(res);
+    return;
+  }
+
   if (isReadRequest && url.pathname === '/health') {
     writeJson(res, 200, {
       ok: true,
-      clients: hub.getClientCount()
+      clients: hub.getClientCount(),
+      sockets: wss.clients.size
     }, headOnly);
     return;
   }
@@ -40,7 +53,11 @@ const server = createServer((req, res) => {
   if (isReadRequest && url.pathname.startsWith('/updates/')) {
     serveStaticFile(res, updateDir, url.pathname.slice('/updates/'.length), {
       headOnly,
-      noStore: url.pathname.endsWith('.json') || url.pathname.endsWith('.yml') || url.pathname.endsWith('.yaml')
+      noStore:
+        url.pathname.endsWith('.html') ||
+        url.pathname.endsWith('.json') ||
+        url.pathname.endsWith('.yml') ||
+        url.pathname.endsWith('.yaml')
     });
     return;
   }
@@ -56,17 +73,43 @@ const server = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-wss.on('connection', (socket, req) => {
+wss.on('connection', (rawSocket, req) => {
+  const socket = rawSocket as AliveWebSocket;
   const user = authenticateRequest(req);
   if (!user) {
     socket.close(4401, 'unauthorized');
     return;
   }
 
-  hub.connect(user, (message) => {
+  const displayNameKey = normalizeDisplayName(user.displayName);
+  for (const rawExistingSocket of wss.clients) {
+    const existingSocket = rawExistingSocket as AliveWebSocket;
+    if (
+      existingSocket !== socket &&
+      existingSocket.userId &&
+      existingSocket.displayNameKey === displayNameKey
+    ) {
+      hub.disconnect(existingSocket.userId);
+      existingSocket.close(4000, 'replaced-by-same-name');
+      existingSocket.terminate();
+    }
+  }
+
+  socket.isAlive = true;
+  socket.userId = user.id;
+  socket.displayNameKey = displayNameKey;
+
+  const send = (message: ServerMessage) => {
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
     }
+  };
+
+  hub.connect(user, send);
+
+  socket.on('pong', () => {
+    socket.isAlive = true;
+    hub.touch(user.id, send);
   });
 
   socket.on('message', (data) => {
@@ -78,11 +121,23 @@ wss.on('connection', (socket, req) => {
   });
 
   socket.on('close', () => {
-    hub.disconnect(user.id);
+    hub.disconnect(user.id, send);
   });
 });
 
 setInterval(() => {
+  for (const rawSocket of wss.clients) {
+    const socket = rawSocket as AliveWebSocket;
+    if (!socket.isAlive) {
+      if (socket.userId) hub.disconnect(socket.userId);
+      socket.terminate();
+      continue;
+    }
+
+    socket.isAlive = false;
+    socket.ping();
+  }
+
   hub.makeHeartbeat();
 }, 25_000).unref();
 
@@ -93,7 +148,7 @@ server.listen(port, host, () => {
 function writeJson(res: ServerResponse, status: number, body: unknown, headOnly = false): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*'
+    ...corsHeaders()
   });
   if (headOnly) {
     res.end();
@@ -131,7 +186,8 @@ function serveStaticFile(
 
   res.writeHead(200, {
     'content-type': contentTypeFor(filePath),
-    'cache-control': options.noStore ? 'no-store' : 'public, max-age=3600'
+    'cache-control': options.noStore ? 'no-store' : 'public, max-age=3600',
+    ...corsHeaders()
   });
   if (options.headOnly) {
     res.end();
@@ -162,4 +218,21 @@ function contentTypeFor(filePath: string): string {
     default:
       return 'application/octet-stream';
   }
+}
+
+function writeCorsPreflight(res: ServerResponse): void {
+  res.writeHead(204, corsHeaders());
+  res.end();
+}
+
+function corsHeaders(): Record<string, string> {
+  return {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-allow-headers': 'content-type, cache-control'
+  };
+}
+
+function normalizeDisplayName(displayName: string): string {
+  return displayName.trim().toLocaleLowerCase();
 }
