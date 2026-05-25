@@ -30,6 +30,7 @@ export type VoiceMode = 'sendrecv' | 'sendonly' | 'recvonly';
 
 export type EndReason =
   | 'hangup'
+  | 'rejected'
   | 'busy'
   | 'unavailable'
   | 'unauthorized'
@@ -48,6 +49,7 @@ export type ClientMessage =
       sessionId: SessionId;
       toUserId: UserId;
       mode: VoiceMode;
+      note?: string;
     }
   | {
       type: 'voice.session.accepted';
@@ -71,6 +73,12 @@ export type ClientMessage =
       sessionId: SessionId;
       toUserId: UserId;
       reason: EndReason;
+    }
+  | {
+      type: 'voice.feedback';
+      sessionId: SessionId;
+      toUserId: UserId;
+      kind: 'rejected' | 'mic-enabled' | 'one-way';
     }
   | {
       type: 'heartbeat.pong';
@@ -93,6 +101,7 @@ export type ServerMessage =
       sessionId: SessionId;
       fromUserId: UserId;
       mode: VoiceMode;
+      note?: string;
     }
   | {
       type: 'voice.session.accepted';
@@ -118,6 +127,12 @@ export type ServerMessage =
       reason: EndReason;
     }
   | {
+      type: 'voice.feedback';
+      sessionId: SessionId;
+      fromUserId: UserId;
+      kind: 'rejected' | 'mic-enabled' | 'one-way';
+    }
+  | {
       type: 'heartbeat.ping';
       at: number;
     }
@@ -134,4 +149,7 @@ export interface VoiceSessionSnapshot {
   state: 'requesting' | 'connecting' | 'connected' | 'reconnecting' | 'ended' | 'failed';
   reason?: EndReason;
   manualEnded: boolean;
+  direction: 'outgoing' | 'incoming';
+  localAudioEnabled: boolean;
+  peerFeedback?: 'rejected' | 'mic-enabled' | 'one-way';
 }

@@ -118,6 +118,7 @@ export class SignalingHub {
       case 'voice.session.accepted':
       case 'voice.sdp':
       case 'voice.ice':
+      case 'voice.feedback':
         this.forwardSessionMessage(client, message);
         break;
       case 'voice.session.end':
@@ -197,13 +198,14 @@ export class SignalingHub {
       type: 'voice.session.request',
       sessionId: message.sessionId,
       fromUserId: client.user.id,
-      mode: message.mode
+      mode: message.mode,
+      note: message.note
     });
   }
 
   private forwardSessionMessage(
     client: ConnectedClient,
-    message: Extract<ClientMessage, { type: 'voice.session.accepted' | 'voice.sdp' | 'voice.ice' }>
+    message: Extract<ClientMessage, { type: 'voice.session.accepted' | 'voice.sdp' | 'voice.ice' | 'voice.feedback' }>
   ): void {
     const session = this.sessions.get(message.sessionId);
     if (!session || session.state === 'ended') {
@@ -238,6 +240,16 @@ export class SignalingHub {
         sessionId: message.sessionId,
         fromUserId: client.user.id,
         description: message.description
+      });
+      return;
+    }
+
+    if (message.type === 'voice.feedback') {
+      target.send({
+        type: 'voice.feedback',
+        sessionId: message.sessionId,
+        fromUserId: client.user.id,
+        kind: message.kind
       });
       return;
     }

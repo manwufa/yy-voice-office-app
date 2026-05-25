@@ -20,10 +20,19 @@ import { VoiceClient } from './webrtc/VoiceClient.js';
 import { SignalClient } from './ws/SignalClient.js';
 
 type SignalStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
+type PresenceMode = 'available' | 'dnd' | 'invisible';
+
+interface UpdateManifest {
+  version: string;
+  notes?: string;
+  downloads?: Partial<Record<NodeJS.Platform | 'windows' | 'macos', string>>;
+}
 
 export function App() {
-  const [signalUrl, setSignalUrl] = useState(import.meta.env.VITE_SIGNAL_SERVER_URL ?? 'ws://127.0.0.1:8787/ws');
+  const [signalUrl, setSignalUrl] = useState(import.meta.env.VITE_SIGNAL_SERVER_URL ?? defaultSignalUrl());
+  const [updateFeedUrl, setUpdateFeedUrl] = useState(import.meta.env.VITE_UPDATE_FEED_URL ?? defaultUpdateFeedUrl());
   const [displayName, setDisplayName] = useState(() => localStorage.getItem('displayName') ?? '');
+  const [intentNote, setIntentNote] = useState('');
   const [userId] = useState(() => makeSessionUserId());
   const [signalStatus, setSignalStatus] = useState<SignalStatus>('idle');
   const [peers, setPeers] = useState<PeerPresence[]>([]);
@@ -31,12 +40,19 @@ export function App() {
   const [sessions, setSessions] = useState<VoiceSessionSnapshot[]>([]);
   const [muted, setMuted] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(false);
+  const [speakerVolume, setSpeakerVolume] = useState(1);
   const [voiceAvailable, setVoiceAvailable] = useState(true);
+  const [presenceMode, setPresenceMode] = useState<PresenceMode>('available');
   const [micReady, setMicReady] = useState(false);
   const [openAtLogin, setOpenAtLogin] = useState(false);
   const [notice, setNotice] = useState('');
+  const [incomingRequest, setIncomingRequest] = useState<{ peerId: UserId; sessionId: string; note?: string } | null>(null);
+  const [incomingCountdown, setIncomingCountdown] = useState(0);
   const signalRef = useRef<SignalClient | null>(null);
   const voiceRef = useRef<VoiceClient | null>(null);
+  const peersRef = useRef<PeerPresence[]>([]);
+  const pendingSinceRef = useRef(new Map<string, number>());
+  const pendingNotifiedRef = useRef(new Set<string>());
 
   const selectedPeer = useMemo(
     () => peers.find((peer) => peer.id === selectedPeerId) ?? null,
@@ -46,10 +62,19 @@ export function App() {
     () => sessions.find((session) => session.peerId === selectedPeerId) ?? null,
     [sessions, selectedPeerId]
   );
+  const incomingPeer = useMemo(
+    () => peers.find((peer) => peer.id === incomingRequest?.peerId) ?? null,
+    [incomingRequest?.peerId, peers]
+  );
+
+  useEffect(() => {
+    peersRef.current = peers;
+  }, [peers]);
 
   useEffect(() => {
     void window.desktop?.getRuntimeConfig().then((config) => {
       setSignalUrl(config.signalServerUrl);
+      setUpdateFeedUrl(config.updateFeedUrl);
     });
     void window.desktop?.getOpenAtLogin().then(setOpenAtLogin);
   }, []);
@@ -74,18 +99,18 @@ export function App() {
         voiceRef.current = voice;
         voice.onSnapshots(setSessions);
         voice.onError(setNotice);
+        voice.onIncomingRequest((request) => {
+          setIncomingRequest(request);
+          setSelectedPeerId(request.peerId);
+        });
+        voice.onFeedback((feedback) => {
+          const peerName = peersRef.current.find((peer) => peer.id === feedback.peerId)?.displayName ?? feedback.peerId;
+          setNotice(feedbackMessage(peerName, feedback.kind));
+        });
         voice.setMuted(muted);
         voice.setSpeakerMuted(speakerMuted);
-        voice.setVoiceAvailable(voiceAvailable);
-        try {
-          await voice.prepareMicrophone();
-          setMicReady(true);
-        } catch {
-          setMicReady(false);
-          setNotice('麦克风不可用，语音接入已暂停。');
-          voice.setVoiceAvailable(false);
-          setVoiceAvailable(false);
-        }
+        voice.setSpeakerVolume(speakerVolume);
+        voice.setPresenceMode(presenceMode);
         return;
       }
 
@@ -123,11 +148,14 @@ export function App() {
       setSelectedPeerId(peerId);
       setNotice('');
       if (!voiceRef.current || !voiceAvailable) return;
-      void voiceRef.current.startConversation(peerId).catch(() => {
-        setNotice('无法建立语音连接，请检查麦克风权限或网络状态。');
-      });
+      void voiceRef.current
+        .startConversation(peerId, intentNote)
+        .then(() => setMicReady(true))
+        .catch(() => {
+          setNotice('无法建立语音连接，请检查麦克风权限或网络状态。');
+        });
     },
-    [voiceAvailable]
+    [intentNote, voiceAvailable]
   );
 
   const toggleMute = useCallback(() => {
@@ -135,20 +163,74 @@ export function App() {
     setMuted(next);
   }, [muted]);
 
+  const handleMicControl = useCallback(() => {
+    if (selectedPeerId && selectedSession && !selectedSession.localAudioEnabled && selectedSession.state !== 'ended') {
+      void voiceRef.current
+        ?.enableMicrophone(selectedPeerId)
+        .then(() => setMicReady(true))
+        .catch(() => {
+          setNotice('无法开启录音，请检查麦克风权限。');
+        });
+      return;
+    }
+    toggleMute();
+  }, [selectedPeerId, selectedSession, toggleMute]);
+
   const toggleSpeaker = useCallback(() => {
     const next = voiceRef.current?.toggleSpeakerMuted() ?? !speakerMuted;
     setSpeakerMuted(next);
   }, [speakerMuted]);
 
-  const toggleVoiceAvailable = useCallback(() => {
-    const next = !voiceAvailable;
-    setVoiceAvailable(next);
-    voiceRef.current?.setVoiceAvailable(next);
-  }, [voiceAvailable]);
+  const changeSpeakerVolume = useCallback((volume: number) => {
+    setSpeakerVolume(volume);
+    voiceRef.current?.setSpeakerVolume(volume);
+  }, []);
+
+  const cyclePresenceMode = useCallback(() => {
+    const next: PresenceMode =
+      presenceMode === 'available' ? 'dnd' : presenceMode === 'dnd' ? 'invisible' : 'available';
+    setPresenceMode(next);
+    setVoiceAvailable(next === 'available');
+    voiceRef.current?.setPresenceMode(next);
+  }, [presenceMode]);
 
   const hangupSelected = useCallback(() => {
     if (selectedPeerId) voiceRef.current?.hangup(selectedPeerId);
   }, [selectedPeerId]);
+
+  const rejectIncoming = useCallback(() => {
+    if (!incomingRequest) return;
+    voiceRef.current?.rejectIncoming(incomingRequest.peerId);
+    setIncomingRequest(null);
+  }, [incomingRequest]);
+
+  const enableIncomingMic = useCallback(() => {
+    if (!incomingRequest) return;
+    void voiceRef.current
+      ?.enableMicrophone(incomingRequest.peerId)
+      .then(() => setMicReady(true))
+      .catch(() => {
+        setNotice('无法开启录音，请检查麦克风权限。');
+      });
+    setIncomingRequest(null);
+  }, [incomingRequest]);
+
+  const keepIncomingOneWay = useCallback(() => {
+    if (!incomingRequest) return;
+    voiceRef.current?.keepOneWay(incomingRequest.peerId);
+    setIncomingRequest(null);
+  }, [incomingRequest]);
+
+  const checkUpdate = useCallback(async () => {
+    try {
+      const response = await fetch(updateFeedUrl, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const manifest = (await response.json()) as UpdateManifest;
+      setNotice(`最新版本：${manifest.version}${manifest.notes ? `，${manifest.notes}` : ''}`);
+    } catch {
+      setNotice('无法检查更新，请确认更新服务可访问。');
+    }
+  }, [updateFeedUrl]);
 
   useEffect(() => {
     return window.desktop?.onTrayCommand((command) => {
@@ -157,6 +239,72 @@ export function App() {
       if (command === 'hangup') hangupSelected();
     });
   }, [hangupSelected, toggleMute, toggleSpeaker]);
+
+  useEffect(() => {
+    if (!incomingRequest) return;
+
+    setIncomingCountdown(30);
+    const intervalId = window.setInterval(() => {
+      setIncomingCountdown((value) => Math.max(0, value - 1));
+    }, 1_000);
+    const timeoutId = window.setTimeout(() => {
+      voiceRef.current?.keepOneWay(incomingRequest.peerId);
+      setIncomingRequest(null);
+      setNotice('已自动保持单向收听，未开启你的麦克风。');
+    }, 30_000);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
+    };
+  }, [incomingRequest]);
+
+  useEffect(() => {
+    if (!incomingRequest) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+      if (event.key === '1') rejectIncoming();
+      if (event.key === '2') enableIncomingMic();
+      if (event.key === '3') keepIncomingOneWay();
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [enableIncomingMic, incomingRequest, keepIncomingOneWay, rejectIncoming]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      const now = Date.now();
+      for (const session of sessions) {
+        const pending =
+          session.direction === 'outgoing' &&
+          !session.peerFeedback &&
+          session.state !== 'ended' &&
+          session.state !== 'failed';
+
+        if (!pending) {
+          pendingSinceRef.current.delete(session.sessionId);
+          pendingNotifiedRef.current.delete(session.sessionId);
+          continue;
+        }
+
+        if (!pendingSinceRef.current.has(session.sessionId)) {
+          pendingSinceRef.current.set(session.sessionId, now);
+        }
+
+        const since = pendingSinceRef.current.get(session.sessionId) ?? now;
+        if (now - since >= 30_000 && !pendingNotifiedRef.current.has(session.sessionId)) {
+          const peerName = peersRef.current.find((peer) => peer.id === session.peerId)?.displayName ?? session.peerId;
+          setNotice(`${peerName} 暂未回应，当前仍保持单向呼叫。`);
+          pendingNotifiedRef.current.add(session.sessionId);
+        }
+      }
+    }, 1_000);
+
+    return () => window.clearInterval(intervalId);
+  }, [sessions]);
 
   const connected = signalStatus === 'connected';
 
@@ -188,6 +336,15 @@ export function App() {
             <span>信令</span>
             <input value={signalUrl} onChange={(event) => setSignalUrl(event.target.value)} disabled={connected} />
           </label>
+          <label>
+            <span>备注</span>
+            <input
+              value={intentNote}
+              onChange={(event) => setIntentNote(event.target.value)}
+              maxLength={120}
+              placeholder="找对方的简短原因"
+            />
+          </label>
           <button className={connected ? 'danger' : 'primary'} onClick={connected ? disconnect : connect}>
             {connected ? <LogOut size={16} /> : <Power size={16} />}
             {connected ? '断开' : '上线'}
@@ -206,7 +363,7 @@ export function App() {
                 <span className={`presence-dot ${peer.status}`} />
                 <span>
                   <strong>{peer.displayName}</strong>
-                  <small>{peer.voiceAvailable ? sessionLabel(session?.state) : presenceLabel(peer)}</small>
+                  <small>{peer.voiceAvailable ? sessionLabel(session) : presenceLabel(peer)}</small>
                 </span>
               </button>
             );
@@ -238,29 +395,62 @@ export function App() {
               <Headphones size={56} />
             </div>
             <h3>{selectedPeer ? selectedPeer.displayName : '未选择联系人'}</h3>
-            <p>{selectedPeer ? sessionLabel(selectedSession?.state) : '待机'}</p>
+            <p>{selectedPeer ? sessionLabel(selectedSession) : '待机'}</p>
             {notice && <div className="notice">{notice}</div>}
           </div>
 
           <div className="controls">
-            <button className={muted ? 'control active' : 'control'} onClick={toggleMute} disabled={!connected}>
+            <button className={muted ? 'control active' : 'control'} onClick={handleMicControl} disabled={!connected}>
               {muted ? <MicOff size={22} /> : <Mic size={22} />}
-              <span>{muted ? '已静音' : '麦克风'}</span>
+              <span>{micControlLabel(selectedSession, muted)}</span>
             </button>
             <button className={speakerMuted ? 'control active' : 'control'} onClick={toggleSpeaker} disabled={!connected}>
               {speakerMuted ? <VolumeX size={22} /> : <Volume2 size={22} />}
               <span>{speakerMuted ? '扬声器关' : '扬声器'}</span>
             </button>
-            <button className={!voiceAvailable ? 'control active' : 'control'} onClick={toggleVoiceAvailable} disabled={!connected}>
+            <button className={presenceMode !== 'available' ? 'control active' : 'control'} onClick={cyclePresenceMode} disabled={!connected}>
               <BellOff size={22} />
-              <span>{voiceAvailable ? '可接入' : '勿扰'}</span>
+              <span>{presenceModeLabel(presenceMode)}</span>
             </button>
             <button className="control danger" onClick={hangupSelected} disabled={!selectedSession || selectedSession.state === 'ended'}>
               <PhoneOff size={22} />
               <span>挂断</span>
             </button>
           </div>
+          <label className="volume-control">
+            <span>收听音量</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={speakerVolume}
+              onChange={(event) => changeSpeakerVolume(Number(event.target.value))}
+            />
+            <strong>{Math.round(speakerVolume * 100)}%</strong>
+          </label>
         </section>
+
+        {incomingRequest && (
+          <div className="incoming-overlay" role="dialog" aria-modal="true">
+            <div className="incoming-dialog">
+              <h3>{incomingPeer?.displayName ?? incomingRequest.peerId}</h3>
+              <p>{incomingRequest.note ? incomingRequest.note : '对方正在找你说话'}</p>
+              <small>当前只听，不发送你的麦克风。{incomingCountdown} 秒后自动保持单向。</small>
+              <div className="incoming-actions">
+                <button className="control danger" onClick={rejectIncoming}>
+                  1 拒绝
+                </button>
+                <button className="control active" onClick={enableIncomingMic}>
+                  2 开启录音
+                </button>
+                <button className="control" onClick={keepIncomingOneWay}>
+                  3 保持单向
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <footer className="footerbar">
           <label className="startup-toggle">
@@ -276,11 +466,27 @@ export function App() {
             />
             开机启动
           </label>
+          <button className="link-button" onClick={checkUpdate}>
+            检查更新
+          </button>
           <span>{sessions.length} 个语音会话</span>
         </footer>
       </section>
     </main>
   );
+}
+
+function defaultSignalUrl(): string {
+  if (window.location.protocol === 'file:') return 'ws://xz42/wufa/YY/ws';
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const basePath = window.location.pathname.startsWith('/wufa/YY/') ? '/wufa/YY' : '';
+  return `${wsProtocol}//${window.location.host}${basePath}/ws`;
+}
+
+function defaultUpdateFeedUrl(): string {
+  if (window.location.protocol === 'file:') return 'http://xz42/wufa/YY/updates/latest.json';
+  const basePath = window.location.pathname.startsWith('/wufa/YY/') ? '/wufa/YY' : '';
+  return `${window.location.origin}${basePath}/updates/latest.json`;
 }
 
 function makeSessionUserId(): string {
@@ -308,18 +514,46 @@ function presenceLabel(peer: PeerPresence): string {
   return peer.voiceAvailable ? '可语音' : '不可接入';
 }
 
-function sessionLabel(state?: VoiceSessionSnapshot['state']): string {
-  if (state === 'requesting') return '正在请求';
-  if (state === 'connecting') return '正在连接';
-  if (state === 'connected') return '已连通';
-  if (state === 'reconnecting') return '正在恢复';
-  if (state === 'failed') return '连接失败';
-  if (state === 'ended') return '已挂断';
+function sessionLabel(session?: VoiceSessionSnapshot | null): string {
+  if (!session) return '未连接';
+  if (session.state === 'connected' && session.direction === 'outgoing') {
+    if (session.peerFeedback === 'mic-enabled') return '双向语音';
+    if (session.peerFeedback === 'one-way') return '对方单向收听';
+    if (session.peerFeedback === 'rejected') return '已拒绝';
+    return '等待对方回应';
+  }
+  if (session.state === 'connected' && session.direction === 'incoming' && !session.localAudioEnabled) return '单向收听';
+  if (session.state === 'connected' && session.direction === 'incoming' && session.localAudioEnabled) return '双向语音';
+  if (session.state === 'requesting') return '正在请求';
+  if (session.state === 'connecting') return '正在连接';
+  if (session.state === 'connected') return '已连通';
+  if (session.state === 'reconnecting') return '正在恢复';
+  if (session.state === 'failed') return '连接失败';
+  if (session.state === 'ended' && session.reason === 'rejected') return '已拒绝';
+  if (session.state === 'ended') return '已挂断';
   return '未连接';
 }
 
 function peerSubtitle(peer: PeerPresence, session: VoiceSessionSnapshot | null): string {
+  if (session?.reason === 'rejected') return '对方已拒绝';
   if (session?.manualEnded) return '本次会话已手动挂断';
-  if (session) return sessionLabel(session.state);
+  if (session) return sessionLabel(session);
   return presenceLabel(peer);
+}
+
+function micControlLabel(session: VoiceSessionSnapshot | null, muted: boolean): string {
+  if (session && !session.localAudioEnabled && session.state !== 'ended') return '开启录音';
+  return muted ? '已静音' : '麦克风';
+}
+
+function feedbackMessage(peerName: string, kind: 'rejected' | 'mic-enabled' | 'one-way'): string {
+  if (kind === 'rejected') return `${peerName} 拒绝了本次语音`;
+  if (kind === 'mic-enabled') return `${peerName} 已开启录音，进入双向语音`;
+  return `${peerName} 选择保持单向收听`;
+}
+
+function presenceModeLabel(mode: PresenceMode): string {
+  if (mode === 'dnd') return '勿扰';
+  if (mode === 'invisible') return '隐身';
+  return '可接入';
 }

@@ -9,14 +9,21 @@ import { SignalClient } from '../ws/SignalClient.js';
 
 type SnapshotListener = (sessions: VoiceSessionSnapshot[]) => void;
 type ErrorListener = (message: string) => void;
+type IncomingRequestListener = (request: { peerId: UserId; sessionId: SessionId; note?: string }) => void;
+type FeedbackKind = 'rejected' | 'mic-enabled' | 'one-way';
+type FeedbackListener = (feedback: { peerId: UserId; sessionId: SessionId; kind: FeedbackKind }) => void;
 
 interface ManagedSession {
   sessionId: SessionId;
   peerId: UserId;
   pc: RTCPeerConnection;
   isOfferer: boolean;
+  direction: 'outgoing' | 'incoming';
   state: VoiceSessionSnapshot['state'];
   manualEnded: boolean;
+  localAudioEnabled: boolean;
+  peerFeedback?: FeedbackKind;
+  localSenders: RTCRtpSender[];
   queuedCandidates: RTCIceCandidateInit[];
   remoteAudio: HTMLAudioElement;
   restartTimer: number | null;
@@ -29,12 +36,15 @@ export class VoiceClient {
   private localStream: MediaStream | null = null;
   private muted = false;
   private speakerMuted = false;
+  private speakerVolume = 1;
   private voiceAvailable = true;
   private readonly sessionsByPeer = new Map<UserId, ManagedSession>();
   private readonly sessionsById = new Map<SessionId, ManagedSession>();
   private readonly manuallyEndedSessions = new Set<SessionId>();
   private readonly snapshotListeners = new Set<SnapshotListener>();
   private readonly errorListeners = new Set<ErrorListener>();
+  private readonly incomingRequestListeners = new Set<IncomingRequestListener>();
+  private readonly feedbackListeners = new Set<FeedbackListener>();
 
   constructor(signal: SignalClient, iceConfig: RTCConfiguration) {
     this.signal = signal;
@@ -45,12 +55,12 @@ export class VoiceClient {
     await this.ensureLocalStream();
   }
 
-  async startConversation(peerId: UserId): Promise<void> {
+  async startConversation(peerId: UserId, note?: string): Promise<void> {
     const existing = this.sessionsByPeer.get(peerId);
     if (existing && existing.state !== 'ended' && existing.state !== 'failed') return;
 
     const sessionId = crypto.randomUUID();
-    const session = await this.createSession(peerId, sessionId, true);
+    const session = await this.createSession(peerId, sessionId, true, true, 'outgoing');
     session.state = 'requesting';
     this.emitSnapshots();
 
@@ -58,7 +68,8 @@ export class VoiceClient {
       type: 'voice.session.request',
       sessionId,
       toUserId: peerId,
-      mode: 'sendrecv'
+      mode: 'sendonly',
+      note: note?.trim() || undefined
     });
     await this.makeOffer(session);
   }
@@ -87,12 +98,28 @@ export class VoiceClient {
     return this.speakerMuted;
   }
 
+  setSpeakerVolume(volume: number): void {
+    this.speakerVolume = Math.min(1, Math.max(0, volume));
+    for (const session of this.sessionsByPeer.values()) {
+      session.remoteAudio.volume = this.speakerVolume;
+    }
+  }
+
   setVoiceAvailable(available: boolean): void {
     this.voiceAvailable = available;
     this.signal.send({
       type: 'presence.update',
       status: available ? 'online' : 'dnd',
       voiceAvailable: available
+    });
+  }
+
+  setPresenceMode(mode: 'available' | 'dnd' | 'invisible'): void {
+    this.voiceAvailable = mode === 'available';
+    this.signal.send({
+      type: 'presence.update',
+      status: mode === 'available' ? 'online' : mode === 'dnd' ? 'dnd' : 'offline',
+      voiceAvailable: mode === 'available'
     });
   }
 
@@ -108,10 +135,49 @@ export class VoiceClient {
     }
   }
 
+  async enableMicrophone(peerId: UserId): Promise<void> {
+    const session = this.sessionsByPeer.get(peerId);
+    if (!session || session.state === 'ended' || session.state === 'failed') return;
+
+    await this.attachLocalAudio(session);
+    this.signal.send({
+      type: 'voice.feedback',
+      sessionId: session.sessionId,
+      toUserId: session.peerId,
+      kind: 'mic-enabled'
+    });
+    await this.makeOffer(session);
+  }
+
+  keepOneWay(peerId: UserId): void {
+    const session = this.sessionsByPeer.get(peerId);
+    if (!session) return;
+
+    this.signal.send({
+      type: 'voice.feedback',
+      sessionId: session.sessionId,
+      toUserId: session.peerId,
+      kind: 'one-way'
+    });
+  }
+
+  rejectIncoming(peerId: UserId): void {
+    const session = this.sessionsByPeer.get(peerId);
+    if (!session) return;
+
+    this.signal.send({
+      type: 'voice.feedback',
+      sessionId: session.sessionId,
+      toUserId: session.peerId,
+      kind: 'rejected'
+    });
+    this.closeSession(session, 'rejected', true, true);
+  }
+
   async handleSignal(message: ServerMessage): Promise<void> {
     switch (message.type) {
       case 'voice.session.request':
-        await this.acceptIncomingRequest(message.fromUserId, message.sessionId);
+        await this.acceptIncomingRequest(message.fromUserId, message.sessionId, message.note);
         break;
       case 'voice.session.accepted':
         this.updateSessionState(message.sessionId, 'connecting');
@@ -124,6 +190,9 @@ export class VoiceClient {
         break;
       case 'voice.session.end':
         this.handleRemoteEnd(message.fromUserId, message.sessionId, message.reason);
+        break;
+      case 'voice.feedback':
+        this.handleFeedback(message.fromUserId, message.sessionId, message.kind);
         break;
       case 'error':
         this.emitError(message.message);
@@ -143,7 +212,17 @@ export class VoiceClient {
     return () => this.errorListeners.delete(listener);
   }
 
-  private async acceptIncomingRequest(peerId: UserId, sessionId: SessionId): Promise<void> {
+  onIncomingRequest(listener: IncomingRequestListener): () => void {
+    this.incomingRequestListeners.add(listener);
+    return () => this.incomingRequestListeners.delete(listener);
+  }
+
+  onFeedback(listener: FeedbackListener): () => void {
+    this.feedbackListeners.add(listener);
+    return () => this.feedbackListeners.delete(listener);
+  }
+
+  private async acceptIncomingRequest(peerId: UserId, sessionId: SessionId, note?: string): Promise<void> {
     if (!this.voiceAvailable) {
       this.signal.send({ type: 'voice.session.end', sessionId, toUserId: peerId, reason: 'busy' });
       return;
@@ -154,40 +233,47 @@ export class VoiceClient {
     const existing = this.sessionsById.get(sessionId);
     if (existing) {
       this.signal.send({ type: 'voice.session.accepted', sessionId, toUserId: peerId });
+      this.emitIncomingRequest(peerId, sessionId, note);
       return;
     }
 
-    await this.createSession(peerId, sessionId, false);
+    await this.createSession(peerId, sessionId, false, false, 'incoming');
     this.signal.send({ type: 'voice.session.accepted', sessionId, toUserId: peerId });
+    this.emitIncomingRequest(peerId, sessionId, note);
   }
 
-  private async createSession(peerId: UserId, sessionId: SessionId, isOfferer: boolean): Promise<ManagedSession> {
-    await this.ensureLocalStream();
-    const localStream = this.localStream;
-    if (!localStream) throw new Error('Microphone stream is not available.');
+  private async createSession(
+    peerId: UserId,
+    sessionId: SessionId,
+    isOfferer: boolean,
+    attachLocalAudio: boolean,
+    direction: 'outgoing' | 'incoming'
+  ): Promise<ManagedSession> {
     const pc = new RTCPeerConnection(this.iceConfig);
     const remoteAudio = new Audio();
     remoteAudio.autoplay = true;
     remoteAudio.muted = this.speakerMuted;
+    remoteAudio.volume = this.speakerVolume;
     remoteAudio.dataset.peerId = peerId;
     remoteAudio.style.display = 'none';
     document.body.append(remoteAudio);
-
-    for (const track of localStream.getAudioTracks()) {
-      pc.addTrack(track, localStream);
-    }
 
     const session: ManagedSession = {
       sessionId,
       peerId,
       pc,
       isOfferer,
+      direction,
       state: 'connecting',
       manualEnded: false,
+      localAudioEnabled: false,
+      localSenders: [],
       queuedCandidates: [],
       remoteAudio,
       restartTimer: null
     };
+
+    if (attachLocalAudio) await this.attachLocalAudio(session);
 
     pc.addEventListener('icecandidate', (event) => {
       this.signal.send({
@@ -240,6 +326,21 @@ export class VoiceClient {
     this.setMuted(this.muted);
   }
 
+  private async attachLocalAudio(session: ManagedSession): Promise<void> {
+    if (session.localAudioEnabled) return;
+
+    await this.ensureLocalStream();
+    const localStream = this.localStream;
+    if (!localStream) throw new Error('Microphone stream is not available.');
+
+    for (const track of localStream.getAudioTracks()) {
+      track.enabled = !this.muted;
+      session.localSenders.push(session.pc.addTrack(track, localStream));
+    }
+    session.localAudioEnabled = true;
+    this.emitSnapshots();
+  }
+
   private async makeOffer(session: ManagedSession): Promise<void> {
     if (session.manualEnded || session.pc.signalingState === 'closed') return;
     const offer = await session.pc.createOffer();
@@ -260,7 +361,7 @@ export class VoiceClient {
     if (this.manuallyEndedSessions.has(sessionId)) return;
 
     let session = this.sessionsById.get(sessionId);
-    if (!session) session = await this.createSession(peerId, sessionId, false);
+    if (!session) session = await this.createSession(peerId, sessionId, false, false, 'incoming');
     if (session.manualEnded || session.pc.signalingState === 'closed') return;
 
     if (description.type === 'offer' && session.pc.signalingState !== 'stable') {
@@ -330,7 +431,16 @@ export class VoiceClient {
   private handleRemoteEnd(peerId: UserId, sessionId: SessionId, reason: EndReason): void {
     const session = this.sessionsById.get(sessionId) ?? this.sessionsByPeer.get(peerId);
     if (!session) return;
-    this.closeSession(session, reason, reason === 'hangup', false);
+    this.closeSession(session, reason, reason === 'hangup' || reason === 'rejected', false);
+  }
+
+  private handleFeedback(peerId: UserId, sessionId: SessionId, kind: FeedbackKind): void {
+    const session = this.sessionsById.get(sessionId) ?? this.sessionsByPeer.get(peerId);
+    if (session) {
+      session.peerFeedback = kind;
+      this.emitSnapshots();
+    }
+    for (const listener of this.feedbackListeners) listener({ peerId, sessionId, kind });
   }
 
   private closeSession(session: ManagedSession, reason: EndReason, manual: boolean, notify: boolean): void {
@@ -371,7 +481,10 @@ export class VoiceClient {
       peerId: session.peerId,
       state: session.state,
       reason: session.reason,
-      manualEnded: session.manualEnded
+      manualEnded: session.manualEnded,
+      direction: session.direction,
+      localAudioEnabled: session.localAudioEnabled,
+      peerFeedback: session.peerFeedback
     }));
   }
 
@@ -382,5 +495,9 @@ export class VoiceClient {
 
   private emitError(message: string): void {
     for (const listener of this.errorListeners) listener(message);
+  }
+
+  private emitIncomingRequest(peerId: UserId, sessionId: SessionId, note?: string): void {
+    for (const listener of this.incomingRequestListeners) listener({ peerId, sessionId, note });
   }
 }

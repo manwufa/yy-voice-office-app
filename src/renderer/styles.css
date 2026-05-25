@@ -328,6 +328,51 @@ select:focus {
   font-size: 13px;
 }
 
+.incoming-overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(36, 35, 31, 0.38);
+  z-index: 10;
+}
+
+.incoming-dialog {
+  display: grid;
+  width: min(460px, 100%);
+  gap: 14px;
+  border: 1px solid #d9d2c4;
+  border-radius: 8px;
+  padding: 22px;
+  background: #fffdf8;
+  box-shadow: 0 24px 70px rgba(36, 35, 31, 0.22);
+  text-align: center;
+}
+
+.incoming-dialog h3 {
+  font-size: 22px;
+}
+
+.incoming-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.volume-control {
+  display: grid;
+  width: min(420px, 100%);
+  grid-template-columns: auto minmax(160px, 1fr) 48px;
+  align-items: center;
+  gap: 12px;
+}
+
+.volume-control input {
+  min-height: 22px;
+  padding: 0;
+}
+
 .startup-toggle {
   display: inline-flex;
   grid-template-columns: none;
@@ -338,6 +383,20 @@ select:focus {
 .startup-toggle input {
   width: 16px;
   min-height: 16px;
+}
+
+.link-button {
+  border: 1px solid #d9d2c4;
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: #315f54;
+  background: #fffdf8;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.link-button:hover {
+  border-color: #bdb2a0;
 }
 
 @media (max-width: 860px) {

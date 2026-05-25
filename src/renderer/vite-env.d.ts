@@ -5,6 +5,7 @@ type TrayCommand = 'show' | 'toggle-mute' | 'toggle-speaker' | 'hangup';
 interface DesktopBridge {
   getRuntimeConfig: () => Promise<{
     signalServerUrl: string;
+    updateFeedUrl: string;
     platform: NodeJS.Platform;
   }>;
   getOpenAtLogin: () => Promise<boolean>;

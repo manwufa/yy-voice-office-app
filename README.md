@@ -21,3 +21,12 @@ Use two app windows or browser tabs, enter different names, and click **上线**
 - The remote side auto-accepts while online and voice-available.
 - Manual hangup ends the current session and prevents automatic resume for that session.
 - Network failures attempt ICE restart and WebSocket reconnect for non-manual disconnects.
+
+## xz42 deployment
+
+- App page: `http://xz42/wufa/YY/app/`
+- WebSocket: `ws://xz42/wufa/YY/ws`
+- Health: `http://xz42/wufa/YY/health`
+- Updates manifest: `http://xz42/wufa/YY/updates/latest.json`
+- Remote files live under `/home/wufa/YY`.
+- Place installer files under `/home/wufa/YY/updates` and add their URLs to `latest.json`.

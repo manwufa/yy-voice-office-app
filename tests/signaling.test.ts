@@ -129,6 +129,30 @@ describe('SignalingHub', () => {
     expect(bob.filter((message) => message.type === 'voice.sdp')).toHaveLength(0);
   });
 
+  it('forwards receiver feedback to the initiator', () => {
+    const { hub, alice } = connectPair();
+
+    hub.handleMessage('alice', {
+      type: 'voice.session.request',
+      sessionId: 's4',
+      toUserId: 'bob',
+      mode: 'sendonly'
+    });
+    hub.handleMessage('bob', {
+      type: 'voice.feedback',
+      sessionId: 's4',
+      toUserId: 'alice',
+      kind: 'one-way'
+    });
+
+    expect(alice).toContainEqual({
+      type: 'voice.feedback',
+      sessionId: 's4',
+      fromUserId: 'bob',
+      kind: 'one-way'
+    });
+  });
+
   it('broadcasts presence separately from voice availability', () => {
     const { hub, bob } = connectPair();
 

@@ -4,6 +4,7 @@ const presenceStatusSchema = z.enum(['online', 'away', 'dnd', 'offline']);
 const voiceModeSchema = z.enum(['sendrecv', 'sendonly', 'recvonly']);
 const endReasonSchema = z.enum([
   'hangup',
+  'rejected',
   'busy',
   'unavailable',
   'unauthorized',
@@ -36,7 +37,8 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('voice.session.request'),
     sessionId: z.string().min(1),
     toUserId: z.string().min(1),
-    mode: voiceModeSchema
+    mode: voiceModeSchema,
+    note: z.string().max(120).optional()
   }),
   z.object({
     type: z.literal('voice.session.accepted'),
@@ -60,6 +62,12 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
     sessionId: z.string().min(1),
     toUserId: z.string().min(1),
     reason: endReasonSchema
+  }),
+  z.object({
+    type: z.literal('voice.feedback'),
+    sessionId: z.string().min(1),
+    toUserId: z.string().min(1),
+    kind: z.enum(['rejected', 'mic-enabled', 'one-way'])
   }),
   z.object({
     type: z.literal('heartbeat.pong'),

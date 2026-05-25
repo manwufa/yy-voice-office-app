@@ -114,7 +114,8 @@ function showMainWindow(): void {
 }
 
 ipcMain.handle('runtime-config', () => ({
-  signalServerUrl: process.env.SIGNAL_SERVER_URL ?? 'ws://127.0.0.1:8787/ws',
+  signalServerUrl: process.env.SIGNAL_SERVER_URL ?? 'ws://xz42/wufa/YY/ws',
+  updateFeedUrl: process.env.UPDATE_FEED_URL ?? 'http://xz42/wufa/YY/updates/latest.json',
   platform: process.platform
 }));
 
